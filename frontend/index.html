@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keyhaven – Hotel Booking</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Figtree:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#" data-view="search">Keyhaven</a>
+    <nav>
+      <button class="link" data-view="search">Find a room</button>
+      <button class="link" data-view="mine" id="navMine" hidden>My bookings</button>
+      <button class="link" data-view="admin" id="navAdmin" hidden>Hotel desk</button>
+      <button class="btn small" id="authBtn">Log in</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Search -->
+    <section id="view-search" class="view">
+      <div class="hero">
+        <h1>Your room is a few taps away.</h1>
+        <form id="searchForm" class="search">
+          <label>City<input name="city" placeholder="Chennai or Ooty"></label>
+          <label>Check-in<input type="date" name="checkIn" required></label>
+          <label>Check-out<input type="date" name="checkOut" required></label>
+          <label>Room type
+            <select name="type"><option value="">Any</option><option>Single</option><option>Double</option><option>Suite</option></select>
+          </label>
+          <label>Max price per night<input type="number" name="maxPrice" min="0" placeholder="No limit"></label>
+          <button class="btn" type="submit">Search rooms</button>
+        </form>
+      </div>
+      <p id="searchMsg" class="msg" role="status"></p>
+      <div id="results" class="grid"></div>
+    </section>
+
+    <!-- Guest bookings -->
+    <section id="view-mine" class="view" hidden>
+      <h2>My bookings</h2>
+      <div id="myBookings" class="stack"></div>
+    </section>
+
+    <!-- Admin -->
+    <section id="view-admin" class="view" hidden>
+      <h2>Hotel desk</h2>
+      <div class="tabs" role="tablist">
+        <button class="tab on" data-tab="bookings">Bookings</button>
+        <button class="tab" data-tab="rooms">Rooms</button>
+        <button class="tab" data-tab="reports">Reports</button>
+      </div>
+      <div id="tab-bookings" class="tabpane"></div>
+      <div id="tab-rooms" class="tabpane" hidden>
+        <form id="roomForm" class="inline">
+          <select name="hotelId" id="hotelSelect" required></select>
+          <input name="roomNumber" placeholder="Room no." required>
+          <select name="type"><option>Single</option><option>Double</option><option>Suite</option></select>
+          <input name="price" type="number" min="1" placeholder="Price / night" required>
+          <input name="capacity" type="number" min="1" placeholder="Sleeps" required>
+          <input name="amenities" placeholder="Amenities">
+          <button class="btn small">Add room</button>
+        </form>
+        <div id="roomList" class="stack"></div>
+      </div>
+      <div id="tab-reports" class="tabpane" hidden></div>
+    </section>
+  </main>
+
+  <!-- Auth dialog -->
+  <dialog id="authDlg">
+    <form id="authForm" class="stack">
+      <h3 id="authTitle">Log in</h3>
+      <div id="regFields" hidden>
+        <label>Full name<input name="name"></label>
+        <label>Phone<input name="phone" type="tel"></label>
+      </div>
+      <label>Email<input name="email" type="email" required></label>
+      <label>Password<input name="password" type="password" minlength="6" required></label>
+      <p class="msg" id="authMsg" role="alert"></p>
+      <div class="row"><button class="btn" id="authSubmit">Log in</button><button type="button" class="link" id="authSwitch">Create an account</button></div>
+    </form>
+  </dialog>
+
+  <!-- Booking dialog -->
+  <dialog id="bookDlg">
+    <form id="bookForm" class="stack">
+      <h3>Book this room</h3>
+      <p id="bookSummary" class="summary"></p>
+      <label>Guest name<input name="guestName" required></label>
+      <label>Number of guests<input name="numGuests" type="number" min="1" value="1" required></label>
+      <label>Card number<input name="card" inputmode="numeric" autocomplete="cc-number" placeholder="4242 4242 4242 4242" required></label>
+      <p class="hint">Demo gateway: any 16 digits works. Numbers ending in 0000 are declined.</p>
+      <p class="msg" id="bookMsg" role="alert"></p>
+      <div class="row"><button class="btn" id="payBtn">Pay and confirm</button><button type="button" class="link" data-close>Cancel</button></div>
+    </form>
+  </dialog>
+
+  <!-- Review dialog -->
+  <dialog id="reviewDlg">
+    <form id="reviewForm" class="stack">
+      <h3>Rate your stay</h3>
+      <label>Rating<select name="rating"><option>5</option><option>4</option><option>3</option><option>2</option><option>1</option></select></label>
+      <label>Comment<textarea name="comment" rows="3"></textarea></label>
+      <p class="msg" id="reviewMsg" role="alert"></p>
+      <div class="row"><button class="btn">Submit review</button><button type="button" class="link" data-close>Cancel</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>
