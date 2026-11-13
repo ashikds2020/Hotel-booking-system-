@@ -1,0 +1,222 @@
+// Hotel Booking System - REST API (Express + SQLite)
+// Run: npm install && npm start  ->  http://localhost:3000
+const express = require('express');
+const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+
+const SECRET = process.env.JWT_SECRET || 'change-me-in-production';
+const db = new Database(path.join(__dirname, 'hbs.db'));
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users(
+  userId INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+  phone TEXT, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'Guest');
+CREATE TABLE IF NOT EXISTS hotels(
+  hotelId INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, address TEXT, city TEXT NOT NULL, rating REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS rooms(
+  roomId INTEGER PRIMARY KEY AUTOINCREMENT, hotelId INTEGER NOT NULL REFERENCES hotels(hotelId),
+  roomNumber TEXT NOT NULL, type TEXT NOT NULL, price REAL NOT NULL, capacity INTEGER NOT NULL,
+  amenities TEXT DEFAULT '', status TEXT DEFAULT 'Active');
+CREATE TABLE IF NOT EXISTS bookings(
+  bookingId INTEGER PRIMARY KEY AUTOINCREMENT, userId INTEGER NOT NULL REFERENCES users(userId),
+  roomId INTEGER NOT NULL REFERENCES rooms(roomId), checkInDate TEXT NOT NULL, checkOutDate TEXT NOT NULL,
+  numGuests INTEGER NOT NULL, guestName TEXT, status TEXT NOT NULL, totalAmount REAL NOT NULL,
+  createdAt TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS payments(
+  paymentId INTEGER PRIMARY KEY AUTOINCREMENT, bookingId INTEGER NOT NULL REFERENCES bookings(bookingId),
+  amount REAL NOT NULL, method TEXT, status TEXT NOT NULL, paymentDate TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS reviews(
+  reviewId INTEGER PRIMARY KEY AUTOINCREMENT, bookingId INTEGER UNIQUE NOT NULL REFERENCES bookings(bookingId),
+  userId INTEGER NOT NULL, roomId INTEGER NOT NULL, rating INTEGER NOT NULL, comment TEXT,
+  date TEXT DEFAULT CURRENT_TIMESTAMP);
+`);
+
+// ---- Seed demo data on first run ----
+if (!db.prepare('SELECT 1 FROM users').get()) {
+  db.prepare('INSERT INTO users(name,email,phone,password,role) VALUES (?,?,?,?,?)')
+    .run('Hotel Admin', 'admin@hbs.com', '0000000000', bcrypt.hashSync('admin123', 10), 'Admin');
+  const h = db.prepare('INSERT INTO hotels(name,address,city,rating) VALUES (?,?,?,?)');
+  const r = db.prepare('INSERT INTO rooms(hotelId,roomNumber,type,price,capacity,amenities) VALUES (?,?,?,?,?,?)');
+  const h1 = h.run('Harbor Light Inn', '12 Quay Street', 'Chennai', 4.5).lastInsertRowid;
+  const h2 = h.run('Hillcrest Lodge', '88 Ridge Road', 'Ooty', 4.2).lastInsertRowid;
+  [[h1,'101','Single',2500,1,'WiFi, AC'],[h1,'102','Double',4200,2,'WiFi, AC, Sea view'],
+   [h1,'201','Suite',8500,4,'WiFi, AC, Balcony, Breakfast'],[h2,'A1','Double',3600,2,'WiFi, Heater, Valley view'],
+   [h2,'A2','Suite',7200,4,'WiFi, Heater, Fireplace']].forEach(x => r.run(...x));
+}
+
+// ---- Helpers ----
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '..', 'frontend')));
+
+const wrap = fn => (req, res) => { try { fn(req, res); } catch (e) { console.error(e); res.status(500).json({ error: 'Server error' }); } };
+const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
+const notify = (user, text) => console.log(`[notify -> ${user.email}] ${text}`); // swap for email/SMS gateway
+const nights = (a, b) => Math.round((new Date(b) - new Date(a)) / 864e5);
+const validDates = (a, b) => /^\d{4}-\d{2}-\d{2}$/.test(a) && /^\d{4}-\d{2}-\d{2}$/.test(b) && nights(a, b) > 0;
+
+const auth = (...roles) => (req, res, next) => {          // role-based access control
+  const t = (req.headers.authorization || '').replace('Bearer ', '');
+  try {
+    req.user = jwt.verify(t, SECRET);
+    if (roles.length && !roles.includes(req.user.role)) return bad(res, 'Forbidden', 403);
+    next();
+  } catch { bad(res, 'Please log in', 401); }
+};
+const staff = auth('Admin', 'SystemAdmin');
+
+const isFree = (roomId, ci, co) => !db.prepare(
+  `SELECT 1 FROM bookings WHERE roomId=? AND status IN ('Confirmed','CheckedIn')
+   AND NOT (checkOutDate<=? OR checkInDate>=?)`).get(roomId, ci, co);
+
+// Mock payment gateway. Replace with Stripe/PayPal/Razorpay; never store raw card data (PCI-DSS).
+// Demo rule: card numbers ending in 0000 are declined.
+const gateway = { charge: (amount, card) => {
+  const n = String(card?.number || '').replace(/\s/g, '');
+  return { ok: /^\d{12,19}$/.test(n) && !n.endsWith('0000'), method: 'card' };
+} };
+
+// ---- Auth ----
+app.post('/api/auth/register', wrap((req, res) => {
+  const { name, email, phone, password } = req.body;
+  if (!name || !/^\S+@\S+\.\S+$/.test(email || '') || (password || '').length < 6) return bad(res, 'Enter a name, a valid email, and a password of 6+ characters');
+  if (db.prepare('SELECT 1 FROM users WHERE email=?').get(email)) return bad(res, 'That email is already registered', 409);
+  const id = db.prepare('INSERT INTO users(name,email,phone,password) VALUES (?,?,?,?)').run(name, email, phone, bcrypt.hashSync(password, 10)).lastInsertRowid;
+  res.status(201).json({ userId: id });
+}));
+
+app.post('/api/auth/login', wrap((req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE email=?').get(req.body.email);
+  if (!u || !bcrypt.compareSync(req.body.password || '', u.password)) return bad(res, 'Email or password is incorrect', 401);
+  const user = { userId: u.userId, name: u.name, email: u.email, role: u.role };
+  res.json({ token: jwt.sign(user, SECRET, { expiresIn: '8h' }), user });
+}));
+
+// ---- Rooms (search, availability, details) ----
+app.get('/api/rooms', wrap((req, res) => {
+  const { city, type, maxPrice, checkIn, checkOut } = req.query;
+  let sql = `SELECT r.*, h.name AS hotelName, h.city, h.rating FROM rooms r JOIN hotels h USING(hotelId) WHERE r.status='Active'`;
+  const p = [];
+  if (city) { sql += ' AND LOWER(h.city) LIKE ?'; p.push(`%${city.toLowerCase()}%`); }
+  if (type) { sql += ' AND r.type=?'; p.push(type); }
+  if (maxPrice) { sql += ' AND r.price<=?'; p.push(+maxPrice); }
+  let rows = db.prepare(sql).all(...p);
+  if (checkIn && checkOut) {
+    if (!validDates(checkIn, checkOut)) return bad(res, 'Check-out must be after check-in');
+    rows = rows.filter(r => isFree(r.roomId, checkIn, checkOut));
+  }
+  res.json(rows);
+}));
+
+app.get('/api/rooms/:id/reviews', wrap((req, res) =>
+  res.json(db.prepare('SELECT rating,comment,date FROM reviews WHERE roomId=? ORDER BY date DESC').all(req.params.id))));
+
+// ---- Bookings (guest) ----
+app.post('/api/bookings', auth(), wrap((req, res) => {
+  const { roomId, checkIn, checkOut, numGuests, guestName, card } = req.body;
+  if (!validDates(checkIn, checkOut) || checkIn < new Date().toISOString().slice(0, 10)) return bad(res, 'Choose valid future dates');
+  const room = db.prepare(`SELECT * FROM rooms WHERE roomId=? AND status='Active'`).get(roomId);
+  if (!room) return bad(res, 'Room not found', 404);
+  if (!guestName || numGuests < 1 || numGuests > room.capacity) return bad(res, `This room sleeps up to ${room.capacity} guests`);
+
+  const total = nights(checkIn, checkOut) * room.price;
+  const result = db.transaction(() => {                    // atomic: no double booking
+    if (!isFree(roomId, checkIn, checkOut)) return { err: 'Sorry, that room was just booked for those dates' };
+    const pay = gateway.charge(total, card);
+    const status = pay.ok ? 'Confirmed' : 'PaymentFailed';
+    const bookingId = db.prepare('INSERT INTO bookings(userId,roomId,checkInDate,checkOutDate,numGuests,guestName,status,totalAmount) VALUES (?,?,?,?,?,?,?,?)')
+      .run(req.user.userId, roomId, checkIn, checkOut, numGuests, guestName, status, total).lastInsertRowid;
+    db.prepare('INSERT INTO payments(bookingId,amount,method,status) VALUES (?,?,?,?)').run(bookingId, total, pay.method, pay.ok ? 'Paid' : 'Failed');
+    return { bookingId, status, total };
+  })();
+  if (result.err) return bad(res, result.err, 409);
+  if (result.status !== 'Confirmed') return bad(res, 'Payment was declined. Check your card details and try again.', 402);
+  notify(req.user, `Booking #${result.bookingId} confirmed. Total ${total}`);
+  res.status(201).json(result);
+}));
+
+app.get('/api/bookings/mine', auth(), wrap((req, res) =>
+  res.json(db.prepare(`SELECT b.*, r.roomNumber, r.type, h.name AS hotelName, h.city,
+    EXISTS(SELECT 1 FROM reviews v WHERE v.bookingId=b.bookingId) AS reviewed
+    FROM bookings b JOIN rooms r USING(roomId) JOIN hotels h USING(hotelId)
+    WHERE b.userId=? AND b.status!='PaymentFailed' ORDER BY b.bookingId DESC`).all(req.user.userId))));
+
+app.patch('/api/bookings/:id/cancel', auth(), wrap((req, res) => {
+  const b = db.prepare('SELECT * FROM bookings WHERE bookingId=? AND userId=?').get(req.params.id, req.user.userId);
+  if (!b) return bad(res, 'Booking not found', 404);
+  if (b.status !== 'Confirmed') return bad(res, 'Only confirmed bookings can be cancelled');
+  if (new Date(b.checkInDate) - Date.now() < 48 * 36e5) return bad(res, 'Free cancellation closes 48 hours before check-in');
+  db.transaction(() => {
+    db.prepare(`UPDATE bookings SET status='Refunded' WHERE bookingId=?`).run(b.bookingId);
+    db.prepare(`UPDATE payments SET status='Refunded' WHERE bookingId=?`).run(b.bookingId);
+  })();
+  notify(req.user, `Booking #${b.bookingId} cancelled and refund of ${b.totalAmount} issued`);
+  res.json({ status: 'Refunded' });
+}));
+
+app.post('/api/reviews', auth(), wrap((req, res) => {
+  const { bookingId, rating, comment } = req.body;
+  const b = db.prepare(`SELECT * FROM bookings WHERE bookingId=? AND userId=? AND status='CheckedOut'`).get(bookingId, req.user.userId);
+  if (!b) return bad(res, 'You can review a stay after check-out');
+  if (!(rating >= 1 && rating <= 5)) return bad(res, 'Rating must be 1 to 5');
+  try { db.prepare('INSERT INTO reviews(bookingId,userId,roomId,rating,comment) VALUES (?,?,?,?,?)').run(bookingId, req.user.userId, b.roomId, rating, comment); }
+  catch { return bad(res, 'You already reviewed this stay', 409); }
+  res.status(201).json({ ok: true });
+}));
+
+// ---- Admin ----
+app.post('/api/admin/hotels', staff, wrap((req, res) => {
+  const { name, address, city } = req.body;
+  if (!name || !city) return bad(res, 'Hotel name and city are required');
+  res.status(201).json({ hotelId: db.prepare('INSERT INTO hotels(name,address,city) VALUES (?,?,?)').run(name, address, city).lastInsertRowid });
+}));
+app.get('/api/admin/hotels', staff, wrap((req, res) => res.json(db.prepare('SELECT * FROM hotels').all())));
+
+app.get('/api/admin/rooms', staff, wrap((req, res) =>
+  res.json(db.prepare(`SELECT r.*, h.name AS hotelName FROM rooms r JOIN hotels h USING(hotelId) WHERE r.status!='Removed'`).all())));
+app.post('/api/admin/rooms', staff, wrap((req, res) => {
+  const { hotelId, roomNumber, type, price, capacity, amenities } = req.body;
+  if (!hotelId || !roomNumber || !type || !(price > 0) || !(capacity > 0)) return bad(res, 'Fill in hotel, room number, type, price and capacity');
+  res.status(201).json({ roomId: db.prepare('INSERT INTO rooms(hotelId,roomNumber,type,price,capacity,amenities) VALUES (?,?,?,?,?,?)')
+    .run(hotelId, roomNumber, type, price, capacity, amenities || '').lastInsertRowid });
+}));
+app.put('/api/admin/rooms/:id', staff, wrap((req, res) => {
+  const { price, status, amenities } = req.body;
+  db.prepare('UPDATE rooms SET price=COALESCE(?,price), status=COALESCE(?,status), amenities=COALESCE(?,amenities) WHERE roomId=?').run(price ?? null, status ?? null, amenities ?? null, req.params.id);
+  res.json({ ok: true });
+}));
+app.delete('/api/admin/rooms/:id', staff, wrap((req, res) => {
+  db.prepare(`UPDATE rooms SET status='Removed' WHERE roomId=?`).run(req.params.id); // soft delete keeps booking history
+  res.json({ ok: true });
+}));
+
+app.get('/api/admin/bookings', staff, wrap((req, res) =>
+  res.json(db.prepare(`SELECT b.*, u.email, r.roomNumber, h.name AS hotelName FROM bookings b
+    JOIN users u USING(userId) JOIN rooms r USING(roomId) JOIN hotels h USING(hotelId)
+    WHERE b.status!='PaymentFailed' ORDER BY b.bookingId DESC`).all())));
+
+app.patch('/api/admin/bookings/:id/:action', staff, wrap((req, res) => {
+  const map = { checkin: ['Confirmed', 'CheckedIn'], checkout: ['CheckedIn', 'CheckedOut'] };
+  const step = map[req.params.action];
+  if (!step) return bad(res, 'Unknown action', 404);
+  const done = db.prepare('UPDATE bookings SET status=? WHERE bookingId=? AND status=?').run(step[1], req.params.id, step[0]);
+  if (!done.changes) return bad(res, `Booking must be ${step[0]} to ${req.params.action}`);
+  res.json({ status: step[1] });
+}));
+
+app.get('/api/admin/reports', staff, wrap((req, res) => {
+  const revenue = db.prepare(`SELECT COALESCE(SUM(amount),0) AS v FROM payments WHERE status='Paid'`).get().v;
+  const byStatus = db.prepare(`SELECT status, COUNT(*) AS count FROM bookings WHERE status!='PaymentFailed' GROUP BY status`).all();
+  const totalRooms = db.prepare(`SELECT COUNT(*) AS c FROM rooms WHERE status='Active'`).get().c;
+  const today = new Date().toISOString().slice(0, 10);
+  const occupied = db.prepare(`SELECT COUNT(DISTINCT roomId) AS c FROM bookings WHERE status IN ('Confirmed','CheckedIn') AND checkInDate<=? AND checkOutDate>?`).get(today, today).c;
+  const monthly = db.prepare(`SELECT substr(checkInDate,1,7) AS month, SUM(totalAmount) AS revenue, COUNT(*) AS bookings
+    FROM bookings WHERE status IN ('Confirmed','CheckedIn','CheckedOut') GROUP BY month ORDER BY month`).all();
+  res.json({ revenue, byStatus, totalRooms, occupiedToday: occupied, occupancyPct: totalRooms ? Math.round(occupied * 100 / totalRooms) : 0, monthly });
+}));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`HBS running on http://localhost:${PORT}`));
